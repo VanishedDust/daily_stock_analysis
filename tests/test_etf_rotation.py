@@ -399,7 +399,7 @@ def _notifier(available=True):
 def test_run_etf_rotation_reports_failures_and_sends_report():
     notifier = _notifier()
     report = run_etf_rotation(
-        _config(), send_notification=True,
+        _config(), send_notification=True, end=_regime_closes().index[-1].date(),
         fetcher_manager=_FakeFetcher(_regime_closes(), broken={"BROKEN"}), notifier=notifier,
     )
 
@@ -414,7 +414,7 @@ def test_run_etf_rotation_reports_failures_and_sends_report():
 
 def test_run_etf_rotation_skips_send_when_disabled():
     notifier = _notifier()
-    run_etf_rotation(_config(), send_notification=False,
+    run_etf_rotation(_config(), send_notification=False, end=_regime_closes().index[-1].date(),
                      fetcher_manager=_FakeFetcher(_regime_closes(), broken={"BROKEN"}), notifier=notifier)
     notifier.send.assert_not_called()
     notifier.save_report_to_file.assert_called_once()
@@ -424,7 +424,7 @@ def test_run_etf_rotation_survives_save_and_send_errors():
     notifier = _notifier()
     notifier.save_report_to_file.side_effect = OSError("read-only")
     notifier.send.side_effect = RuntimeError("channel crashed")
-    report = run_etf_rotation(_config(), send_notification=True,
+    report = run_etf_rotation(_config(), send_notification=True, end=_regime_closes().index[-1].date(),
                               fetcher_manager=_FakeFetcher(_regime_closes(), broken={"BROKEN"}), notifier=notifier)
 
     assert "最新信号" in report.markdown
@@ -433,7 +433,7 @@ def test_run_etf_rotation_survives_save_and_send_errors():
 
 def test_run_etf_rotation_treats_malformed_frame_as_single_failure():
     report = run_etf_rotation(
-        _config(etf_rotation_pool=["A", "B"]), send_notification=False,
+        _config(etf_rotation_pool=["A", "B"]), send_notification=False, end=_regime_closes().index[-1].date(),
         fetcher_manager=_FakeFetcher(_regime_closes(), malformed={"B"}), notifier=_notifier(),
     )
     assert "date" in report.failed_codes["B"]
@@ -445,6 +445,66 @@ def test_load_closes_drops_bars_after_end():
     end = closes.index[-3].date()
     loaded = load_closes(_FakeFetcher(closes), ["A"], years=1, end=end)
     assert loaded.closes.index[-1] == pd.Timestamp(end)
+
+
+@pytest.mark.parametrize("missing_day", ["2024-01-15", "2024-01-12"])
+@pytest.mark.parametrize("omit_row", [False, True])
+@pytest.mark.parametrize("codes", [["A"], ["A", "B"]])
+def test_service_keeps_missing_sessions_before_backtest(missing_day, omit_row, codes):
+    from src.core import trading_calendar
+
+    sessions = trading_calendar.xcals.get_calendar("XSHG").sessions_in_range("2024-01-02", "2024-04-30")
+    sessions = sessions.tz_localize(None)
+    closes = pd.DataFrame({code: 100 * 1.002 ** np.arange(len(sessions)) for code in codes}, index=sessions)
+    missing = pd.Timestamp(missing_day)
+    closes.loc[missing] = np.nan
+    if omit_row:
+        closes = closes.drop(index=missing)
+    loaded = load_closes(_FakeFetcher(closes), codes, years=1, end=sessions[-1].date())
+
+    assert loaded.closes.index.equals(sessions)
+    assert loaded.closes.loc[missing].isna().all()
+    result = run_backtest(loaded.closes, codes, None, RotationParams(lookback_days=5, top_n=1, cost_bps=0))
+    assert result.trades[0].signal_date == pd.Timestamp("2024-01-19")
+    assert result.trades[0].exec_date == pd.Timestamp("2024-01-22")
+    assert any("行情缺失" in warning for warning in data_quality_warnings(loaded))
+
+
+def test_service_keeps_trailing_missing_session_and_excludes_holidays():
+    closes = pd.DataFrame({"A": [100.0, 101.0]}, index=pd.to_datetime(["2024-02-07", "2024-02-08"]))
+    loaded = load_closes(_FakeFetcher(closes), ["A"], years=1, end=pd.Timestamp("2024-02-19").date())
+    assert loaded.closes.index.tolist() == list(pd.to_datetime(["2024-02-07", "2024-02-08", "2024-02-19"]))
+    assert pd.isna(loaded.closes.loc["2024-02-19", "A"])
+    assert any("行情缺失" in warning for warning in data_quality_warnings(loaded))
+
+
+def test_service_history_requires_calendar(monkeypatch):
+    from src.core import trading_calendar
+
+    monkeypatch.setattr(trading_calendar, "_XCALS_AVAILABLE", False)
+    closes = pd.DataFrame({"A": [100.0]}, index=pd.to_datetime(["2024-01-02"]))
+    with pytest.raises(ValueError, match="trading calendar unavailable"):
+        load_closes(_FakeFetcher(closes), ["A"], years=1, end=closes.index[-1].date())
+
+
+def test_service_report_uses_cutoff_session_when_latest_quotes_are_omitted():
+    from src.core import trading_calendar
+
+    sessions = trading_calendar.xcals.get_calendar("XSHG").sessions_in_range("2024-01-02", "2024-02-19")
+    sessions = sessions.tz_localize(None)
+    closes = pd.DataFrame({"A": 100 * 1.002 ** np.arange(len(sessions) - 1)}, index=sessions[:-1])
+    notifier = _notifier()
+    report = run_etf_rotation(
+        _config(etf_rotation_pool=["A"], etf_rotation_safe_asset="", etf_rotation_lookback_days=5),
+        send_notification=False, fetcher_manager=_FakeFetcher(closes), notifier=notifier,
+        end=sessions[-1].date(),
+    )
+    assert report.as_of == pd.Timestamp("2024-02-19")
+    assert report.target_weights == {CASH: 1.0}
+    assert any("行情缺失" in warning for warning in report.warnings)
+    assert "# ETF 轮动信号 2024-02-19" in report.markdown
+    notifier.save_report_to_file.assert_called_once_with(report.markdown, "etf_rotation_20240219.md")
+    notifier.send.assert_not_called()
 
 
 def test_rotation_real_manager_skips_raw_providers_and_requests_adjusted_efinance(monkeypatch):

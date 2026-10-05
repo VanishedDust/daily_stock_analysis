@@ -14,6 +14,25 @@ import pandas as pd
 from src.core import trading_calendar
 
 
+def test_trading_dates_preserve_session_labels_with_utc_timezone():
+    sessions = pd.to_datetime(["2024-02-08", "2024-02-19"], utc=True)
+    calendar = SimpleNamespace(sessions_in_range=lambda start, end: sessions)
+    with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), \
+            patch.object(trading_calendar.xcals, "get_calendar", return_value=calendar):
+        result = trading_calendar.get_trading_dates("cn", date(2024, 2, 8), date(2024, 2, 19))
+    assert result.equals(sessions.tz_localize(None))
+
+
+def test_trading_dates_do_not_fail_open_outside_calendar_range():
+    with patch.object(trading_calendar, "_XCALS_AVAILABLE", True), \
+            patch.object(trading_calendar.xcals, "get_calendar", side_effect=ValueError("out of range")):
+        assert trading_calendar.get_trading_dates("cn", date(2000, 1, 1), date(2000, 1, 2)) is None
+
+
+def test_trading_dates_do_not_invent_sessions_for_unknown_market():
+    assert trading_calendar.get_trading_dates("unknown", date(2024, 1, 2), date(2024, 1, 3)) is None
+
+
 class _FakeCalendar:
     def __init__(
         self,

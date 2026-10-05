@@ -83,12 +83,12 @@ def _close_series(code: str, df: Optional[pd.DataFrame], end_day: date) -> pd.Se
         raise ValueError(f"daily data missing columns: {missing}")
     closes = pd.to_numeric(df["close"], errors="coerce")
     closes = closes.replace([math.inf, -math.inf], math.nan).where(closes > 0)
-    closes.index = pd.to_datetime(df["date"])
-    closes = closes[~closes.index.duplicated(keep="last")].dropna().sort_index()
+    closes.index = pd.DatetimeIndex(pd.to_datetime(df["date"])).tz_localize(None).normalize()
+    closes = closes[~closes.index.duplicated(keep="last")].sort_index()
     kept = closes.loc[: pd.Timestamp(end_day)]
     if len(kept) < len(closes):
         logger.info("[ETF轮动] %s 丢弃 %s 之后的 %d 根未收盘 K 线", code, end_day, len(closes) - len(kept))
-    if kept.empty:
+    if not kept.notna().any():
         raise ValueError("no valid close prices")
     return kept
 
@@ -101,7 +101,9 @@ def load_closes(
 ) -> LoadedPrices:
     """Fetch daily closes per code; failures are returned, not swallowed.
 
-    Bars after ``end`` (e.g. an unfinished intraday bar) are dropped.
+    Bars after ``end`` (e.g. an unfinished intraday bar) are dropped. Reindex
+    against actual A-share sessions through ``end``; missing quotes stay NaN.
+    An unavailable historical calendar raises rather than inventing sessions.
     """
     end_day = end or date.today()
     start_day = end_day - timedelta(days=int(years * 365.25))
@@ -149,6 +151,15 @@ def load_closes(
         logger.info("[ETF轮动] %s 获取 %d 条日线 (来源: %s)", code, len(series[code]), source)
 
     frame = pd.DataFrame(series).sort_index() if series else pd.DataFrame()
+    if not frame.empty:
+        from src.core.trading_calendar import get_trading_dates
+
+        sessions = get_trading_dates(CALENDAR_MARKET, frame.index[0].date(), end_day)
+        if sessions is None:
+            raise ValueError("A-share trading calendar unavailable for ETF rotation history")
+        # Keep sessions even when every source omits the date; otherwise missing
+        # execution days become delayed trades and missing Fridays shift signals.
+        frame = frame.reindex(sessions)
     return LoadedPrices(closes=frame, requested_start=start_day, failed=failed, sources=sources)
 
 
