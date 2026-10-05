@@ -78,9 +78,13 @@ class BacktestResult:
 
 def prepare_closes(closes: pd.DataFrame) -> pd.DataFrame:
     """Sort by date and bridge short suspensions; pre-listing gaps stay NaN."""
+    return _valid_closes(closes).ffill(limit=MAX_FORWARD_FILL_DAYS)
+
+
+def _valid_closes(closes: pd.DataFrame) -> pd.DataFrame:
     frame = closes.sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
-    return frame.ffill(limit=MAX_FORWARD_FILL_DAYS)
+    frame = frame[~frame.index.duplicated(keep="last")].apply(pd.to_numeric, errors="coerce")
+    return frame.replace([math.inf, -math.inf], math.nan).where(frame > 0)
 
 
 def momentum_scores(closes: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
@@ -180,7 +184,8 @@ def run_backtest(
         safe_asset = None
 
     frame = prepare_closes(closes)
-    scores = momentum_scores(frame[risk], params.lookback_days)
+    quoted = _valid_closes(closes)
+    scores = momentum_scores(frame[risk], params.lookback_days).where(quoted[risk].notna())
     valid_rows = scores.notna().any(axis=1)
     if not valid_rows.any():
         raise ValueError(
@@ -189,8 +194,11 @@ def run_backtest(
     start = valid_rows.idxmax()
     frame = frame.loc[start:]
     scores = scores.loc[start:]
-    # NaN return = not tradable yet (pre-listing) -> treated as 0 for any weight held.
-    daily_returns = frame.pct_change(fill_method=None).fillna(0.0)
+    quoted = quoted.loc[start:]
+    # Carry the last known mark for valuation, never for execution. On quote
+    # recovery the full change from that mark belongs to existing holders.
+    valuation = _valid_closes(closes).ffill().loc[start:]
+    daily_returns = valuation.pct_change(fill_method=None).fillna(0.0)
 
     rebal = set(rebalance_dates(frame.index, params.rebalance))
     dates = list(frame.index)
@@ -211,17 +219,22 @@ def run_backtest(
         if i > 0:
             weights, port_ret = _drift(weights, {c: row[c] for c in weights if c in row})
             equity *= 1.0 + port_ret
-            listed = [c for c in risk if pd.notna(frame.loc[day, c]) and pd.notna(frame[c].iloc[i - 1])]
+            listed = [c for c in risk if pd.notna(valuation.loc[day, c]) and pd.notna(valuation[c].iloc[i - 1])]
             bench *= 1.0 + (float(row[listed].mean()) if listed else 0.0)
 
         if pending is not None and pending[0] == i:
             _, signal_day, new_holdings = pending
             pending = None
-            if entry is None:
-                entry = i
+            available_safe = safe_asset if safe_asset and pd.notna(quoted.loc[day, safe_asset]) else None
+            target = holdings_to_weights(new_holdings, params.top_n, available_safe)
+            # Do not fabricate a buy or sell at a carried-forward price. Keep
+            # the current portfolio until a later scheduled signal can trade.
+            involved = (set(weights) | set(target)) - {CASH}
+            can_trade = all(pd.notna(quoted.loc[day, code]) for code in involved)
             # Same holdings -> no trade; drifted weights are not re-equalised.
-            if not trades or set(new_holdings) != set(holdings):
-                target = holdings_to_weights(new_holdings, params.top_n, safe_asset)
+            if can_trade and (entry is None or set(target) != set(weights)):
+                if entry is None:
+                    entry = i
                 turnover = _turnover(weights, target)
                 if turnover > 1e-9:
                     equity *= 1.0 - turnover * cost_rate
@@ -317,7 +330,7 @@ def parameter_sweep(
             cost_bps=params.cost_bps,
         )
         try:
-            runs.append((lookback, run_backtest(frame, risk, safe_asset, swept)))
+            runs.append((lookback, run_backtest(closes, risk, safe_asset, swept)))
         except ValueError:  # not enough history for this lookback
             continue
     last_day = frame.index[-1]
@@ -340,5 +353,6 @@ def latest_ranking(
     frame = prepare_closes(closes)
     risk = [c for c in risk_assets if c in frame.columns]
     scores = momentum_scores(frame[risk], params.lookback_days)
+    scores = scores.where(_valid_closes(closes)[risk].notna())
     as_of = frame.index[-1]
     return as_of, scores.loc[as_of].sort_values(ascending=False, na_position="last")

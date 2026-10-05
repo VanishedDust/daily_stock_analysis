@@ -1449,7 +1449,7 @@ def _skips_stock_entry(args: argparse.Namespace, config: Config) -> bool:
     ``--stocks``/``STOCK_LIST`` tokens nor refresh the stock-index registry
     before the mode dispatch, otherwise an unsupported index token would
     wrongly block a run that never consumes it. Covered modes:
-    ``--backtest``, ``--market-review``, ``--serve-only``/``--webui-only``,
+    ``--backtest``, ``--market-review``, ``--etf-rotation``, ``--serve-only``/``--webui-only``,
     ``--portfolio`` (any value) and ``--schedule``/``config.schedule_enabled``.
     ``--serve`` (not serve-only) and plain one-shot runs still consume the
     stock list and stay outside the guard. The webui-only flag is read
@@ -1458,6 +1458,7 @@ def _skips_stock_entry(args: argparse.Namespace, config: Config) -> bool:
     """
     return bool(
         getattr(args, "backtest", False)
+        or getattr(args, "etf_rotation", False)
         or getattr(args, "market_review", False)
         or getattr(args, "serve_only", False)
         or getattr(args, "webui_only", False)

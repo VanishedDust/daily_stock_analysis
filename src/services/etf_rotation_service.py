@@ -21,6 +21,7 @@ from src.core.etf_rotation import (
     DAYS_PER_YEAR,
     BacktestResult,
     RotationParams,
+    MAX_FORWARD_FILL_DAYS,
     annual_returns,
     compute_metrics,
     holdings_to_weights,
@@ -81,6 +82,7 @@ def _close_series(code: str, df: Optional[pd.DataFrame], end_day: date) -> pd.Se
     if missing:
         raise ValueError(f"daily data missing columns: {missing}")
     closes = pd.to_numeric(df["close"], errors="coerce")
+    closes = closes.replace([math.inf, -math.inf], math.nan).where(closes > 0)
     closes.index = pd.to_datetime(df["date"])
     closes = closes[~closes.index.duplicated(keep="last")].dropna().sort_index()
     kept = closes.loc[: pd.Timestamp(end_day)]
@@ -107,14 +109,38 @@ def load_closes(
     failed: Dict[str, str] = {}
     sources: Dict[str, str] = {}
 
+    from data_provider.base import DataFetcherManager, _is_etf_code
+
+    # Keep the existing priority/fallback manager, but give this consumer a
+    # request-local list whose ETF paths explicitly request forward adjustment.
+    # Never change the shared manager or quietly use raw-price fallback sources.
+    adjusted_manager = None
+    if isinstance(fetcher_manager, DataFetcherManager):
+        eligible = [
+            fetcher for fetcher in fetcher_manager._get_fetchers_snapshot()
+            if fetcher.name in {"EfinanceFetcher", "AkshareFetcher", "BaostockFetcher"}
+            or (fetcher.name == "TickFlowFetcher" and fetcher.kline_adjust == "forward")
+        ]
+        if eligible:
+            adjusted_manager = DataFetcherManager(fetchers=eligible)
+
     for code in codes:
         try:
-            df, source = fetcher_manager.get_daily_data(
+            if isinstance(fetcher_manager, DataFetcherManager):
+                if not _is_etf_code(code):
+                    raise ValueError("rotation requires an A-share ETF code")
+                if adjusted_manager is None:
+                    raise ValueError("no forward-adjusted ETF data source available")
+            manager = adjusted_manager or fetcher_manager
+            df, source = manager.get_daily_data(
                 code,
                 start_date=start_day.isoformat(),
                 end_date=end_day.isoformat(),
             )
-            series[code] = _close_series(code, df, end_day)
+            close_series = _close_series(code, df, end_day)
+            if adjusted_manager is None and df.attrs.get("price_adjustment") != "forward":
+                raise ValueError("daily source does not confirm forward-adjusted prices")
+            series[code] = close_series
         except Exception as exc:  # fetch errors and malformed frames alike
             failed[code] = str(exc) or type(exc).__name__
             logger.warning("[ETF轮动] %s 日线不可用: %s", code, failed[code])
@@ -137,6 +163,15 @@ def data_quality_warnings(loaded: LoadedPrices) -> List[str]:
         series = loaded.closes[code].dropna()
         if series.empty:
             continue
+        missing = loaded.closes[code].isna() & loaded.closes[code].notna().cummax()
+        longest_gap = int(missing.groupby((~missing).cumsum()).sum().max())
+        if longest_gap:
+            warnings.append(
+                f"{code} 上市后行情缺失，最长连续 {longest_gap} 根；缺报价日不成交，"
+                "持仓按最后报价估值，恢复报价时计入完整损益"
+            )
+            if longest_gap > MAX_FORWARD_FILL_DAYS:
+                warnings.append(f"{code} 行情缺口超过 {MAX_FORWARD_FILL_DAYS} 根，动量信号在缺口期间不可用")
         if series.index[0] > limit:
             warnings.append(
                 f"{code} 历史起点为 {series.index[0]:%Y-%m-%d}（请求 {loaded.requested_start:%Y-%m-%d}），"
@@ -311,14 +346,14 @@ def build_report(
 ) -> RotationReport:
     """Render the report; ``next_session`` resolves the trading day after a date."""
     risk = [c for c in risk_assets if c in closes.columns]
-    usable_safe = safe_asset if safe_asset and safe_asset in closes.columns else None
-
-    result = run_backtest(closes, risk, usable_safe, params)
+    result = run_backtest(closes, risk, safe_asset, params)
     as_of, ranking = latest_ranking(closes, risk, params)
+    safe_close = closes.loc[as_of, safe_asset] if safe_asset and safe_asset in closes.columns else math.nan
+    usable_safe = safe_asset if pd.notna(safe_close) and math.isfinite(safe_close) and safe_close > 0 else None
     target_holdings = select_holdings(ranking, result.final_holdings, params)
     target = holdings_to_weights(target_holdings, params.top_n, usable_safe)
     # Compare holdings, not weights: live weights drift away from the exact 1/top_n split.
-    changed = set(target_holdings) != set(result.final_holdings)
+    changed = set(target) != set(result.final_weights)
     following = next_session(as_of.date()) if next_session else None
     rebalance_day = is_rebalance_day(as_of, pd.Timestamp(following), params.rebalance) if following else None
 
@@ -328,7 +363,7 @@ def build_report(
     start, end = result.equity.index[0], result.equity.index[-1]
     has_backtest = (end - start).days / DAYS_PER_YEAR >= MIN_BACKTEST_YEARS
     if has_backtest:
-        sweep = parameter_sweep(closes, risk, usable_safe, params, min_years=MIN_BACKTEST_YEARS)
+        sweep = parameter_sweep(closes, risk, safe_asset, params, min_years=MIN_BACKTEST_YEARS)
     else:
         sweep = []
         notes.append(

@@ -249,6 +249,49 @@ def test_pre_listing_asset_is_ignored_until_it_has_history():
     assert first_b.signal_date >= closes.index[250 + 20]
 
 
+def test_held_asset_recovery_books_full_loss_and_never_trades_missing_quotes():
+    closes = pd.DataFrame({"A": _path(np.full(80, 0.002))}, index=_dates(80, "2024-01-01"))
+    closes.iloc[20:28, 0] = np.nan
+    closes.iloc[28:, 0] *= 0.8
+    result = run_backtest(closes, ["A"], None, RotationParams(lookback_days=5, cost_bps=0))
+    assert result.equity.loc[closes.index[28]] / result.equity.loc[closes.index[19]] == pytest.approx(
+        closes.iloc[28, 0] / closes.iloc[19, 0],
+    )
+    for trade in result.trades:
+        for code in (set(trade.from_weights) | set(trade.to_weights)) - {CASH}:
+            assert pd.notna(closes.loc[trade.exec_date, code])
+    loaded = LoadedPrices(closes, requested_start=closes.index[0].date())
+    assert any("最长连续 8 根" in note for note in data_quality_warnings(loaded))
+
+
+def test_defensive_asset_is_cash_until_it_has_an_execution_quote():
+    closes = pd.DataFrame({"A": _path(np.full(90, -0.002)), "SAFE": 1.0}, index=_dates(90))
+    closes.loc[closes.index[:40], "SAFE"] = np.nan
+    result = run_backtest(closes, ["A"], "SAFE", RotationParams(lookback_days=5, cost_bps=0))
+    safe_trades = [trade for trade in result.trades if "SAFE" in trade.to_weights]
+    assert safe_trades
+    assert all(trade.exec_date >= closes.index[40] for trade in safe_trades)
+    assert (result.equity.loc[:closes.index[39]] == 1.0).all()
+
+
+def test_latest_missing_defensive_quote_recommends_cash_not_phantom_buy():
+    closes = pd.DataFrame({"A": _path(np.full(90, -0.002)), "SAFE": 1.0}, index=_dates(90))
+    closes.loc[closes.index[-10:], "SAFE"] = np.nan
+    report = build_report(closes, ["A"], "SAFE", RotationParams(lookback_days=5), {})
+    assert report.target_weights == {CASH: 1.0}
+    assert any("防守资产 SAFE 不可用" in warning for warning in report.warnings)
+
+
+def test_parameter_sweep_matches_backtest_with_post_listing_long_gap():
+    closes = pd.DataFrame({"A": _path(np.full(600, 0.002)), "B": 1.0}, index=_dates(600))
+    closes.loc[closes.index[300:307], "A"] = np.nan
+    closes.loc[closes.index[307:], "A"] *= 0.9
+    params = RotationParams(lookback_days=20, cost_bps=0)
+    main = run_backtest(closes, ["A", "B"], None, params)
+    swept = dict(parameter_sweep(closes, ["A", "B"], None, params, lookbacks=(20,)))
+    assert swept[20] == pytest.approx(compute_metrics(main.equity), nan_ok=True)
+
+
 def test_backtest_requires_enough_history():
     closes = pd.DataFrame({"A": [1.0, 1.1, 1.2]}, index=_dates(3))
     with pytest.raises(ValueError):
@@ -322,7 +365,9 @@ class _FakeFetcher:
         series = self._closes[code]
         if code in self._malformed:
             return pd.DataFrame({"trade_date": series.index, "close": series.values}), "fake"
-        return pd.DataFrame({"date": series.index, "close": series.values}), "fake"
+        frame = pd.DataFrame({"date": series.index, "close": series.values})
+        frame.attrs["price_adjustment"] = "forward"
+        return frame, "fake"
 
     def get_stock_name(self, code, allow_realtime=True):
         return {"A": "进攻ETF", "B": "防守ETF"}.get(code)
@@ -400,6 +445,61 @@ def test_load_closes_drops_bars_after_end():
     end = closes.index[-3].date()
     loaded = load_closes(_FakeFetcher(closes), ["A"], years=1, end=end)
     assert loaded.closes.index[-1] == pd.Timestamp(end)
+
+
+def test_rotation_real_manager_skips_raw_providers_and_requests_adjusted_efinance(monkeypatch):
+    import efinance
+    from data_provider.base import DataFetcherManager
+    from data_provider.efinance_fetcher import EfinanceFetcher
+
+    raw = pd.DataFrame({"日期": _dates(40), "收盘": np.linspace(10, 11, 40)})
+    requests = []
+
+    def quote_history(**kwargs):
+        requests.append(kwargs)
+        return raw
+
+    monkeypatch.setattr(efinance.stock, "get_quote_history", quote_history)
+    ef = EfinanceFetcher(sleep_min=0, sleep_max=0)
+    monkeypatch.setattr(ef, "_set_random_user_agent", lambda: None)
+    raw_providers = [SimpleNamespace(name=name, priority=0, get_daily_data=MagicMock())
+                     for name in ("TushareFetcher", "PytdxFetcher", "TickFlowFetcher")]
+    raw_providers[-1].kline_adjust = "none"
+    manager = DataFetcherManager(fetchers=[*raw_providers, ef])
+    original = manager._get_fetchers_snapshot()
+    loaded = load_closes(manager, ["510300"], years=1, end=raw["日期"].iloc[-1].date())
+    assert not loaded.failed
+    assert loaded.sources == {"510300": "EfinanceFetcher"}
+    assert loaded.closes["510300"].iloc[-1] == pytest.approx(11)
+    assert requests and requests[0]["fqt"] == 1
+    assert manager._get_fetchers_snapshot() == original
+    for provider in raw_providers:
+        provider.get_daily_data.assert_not_called()
+
+
+def test_rotation_without_adjusted_provider_fails_explicitly_without_raw_call():
+    from data_provider.base import DataFetcherManager
+
+    provider = SimpleNamespace(name="TushareFetcher", priority=0, get_daily_data=MagicMock())
+    loaded = load_closes(DataFetcherManager(fetchers=[provider]), ["510300"], years=1)
+    assert loaded.closes.empty
+    assert "forward-adjusted" in loaded.failed["510300"]
+    provider.get_daily_data.assert_not_called()
+
+
+def test_injected_rotation_provider_must_confirm_adjustment():
+    provider = SimpleNamespace(get_daily_data=lambda *args, **kwargs: (
+        pd.DataFrame({"date": _dates(20), "close": 10}), "unknown",
+    ))
+    loaded = load_closes(provider, ["510300"], years=1)
+    assert "does not confirm" in loaded.failed["510300"]
+
+
+def test_latest_missing_risk_quote_is_not_selected_from_forward_filled_price():
+    closes = _regime_closes(90)
+    closes.iloc[-1, closes.columns.get_loc("A")] = np.nan
+    report = build_report(closes, ["A"], None, RotationParams(lookback_days=5), {})
+    assert "A" not in report.target_weights
 
 
 def _next_bday(day):
